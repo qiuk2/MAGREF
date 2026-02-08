@@ -200,7 +200,7 @@ def generate(args):
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
         device_id=device,
-        rank=rank,
+        rank=0,
         t5_fsdp=args.t5_fsdp,
         dit_fsdp=args.dit_fsdp,
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
@@ -210,7 +210,6 @@ def generate(args):
     logging.info("Generating video ...")
     for key, prompt, img_paths in prompt_image_pairs:
         pil_img = [Image.open(p).convert("RGB") for p in img_paths]
-        logging.info(f"Generating video for {img_paths} ...")
 
         video = magref_model.generate(
             prompt,
