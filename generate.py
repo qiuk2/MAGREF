@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import sys
@@ -70,7 +71,12 @@ def _parse_args():
         "--prompt_path",
         type=str,
         default=None,
-        help="Path to a file containing prompts and reference images for video generation.")
+        help="Path to a JSON file containing prompts for video generation.")
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Path to the directory containing reference images. Each sample's images should be in a subfolder named by its index.")
     parser.add_argument(
         "--base_seed",
         type=int,
@@ -107,7 +113,8 @@ def _init_logging(rank):
         logging.basicConfig(
             level=logging.INFO,
             format="[%(asctime)s] %(levelname)s: %(message)s",
-            handlers=[logging.StreamHandler(stream=sys.stdout)])
+            handlers=[logging.StreamHandler(stream=sys.stdout)],
+            force=True)
     else:
         logging.basicConfig(level=logging.ERROR)
 
@@ -165,20 +172,28 @@ def generate(args):
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
     
+    # Read prompts from JSON file
     prompt_path = args.prompt_path
     with open(prompt_path, 'r') as f:
-        lines = f.readlines()
+        all_prompts = json.load(f)
 
-    prompt_image_pairs = []
-    for line in lines:
-        items = line.strip().split('@@')
-        if len(items) < 2:
-            raise ValueError(f"Invalid format in line: {line}")
-        
-        key = items[0]
-        prompt = items[1].strip()
-        img_paths = [p.strip() for p in items[2:] if p.strip()]
-        prompt_image_pairs.append((key, prompt, img_paths))
+
+    # Collect all (key, prompt, img_paths) tuples
+    all_pairs = []
+    for idx, item in enumerate(all_prompts):
+        key = idx
+        prompt = item["prompt_rewritten"]
+        # Look for reference images in image_dir/<idx>/
+        img_paths = []
+        for refs in item["refs"]:
+            path = refs["image_path"].replace("/edrive1/kaiq/VER-bench/data/first3k/unknown_first3k", args.image_dir)
+            img_paths.append(path)
+
+        all_pairs.append((key, prompt, img_paths))
+
+    # Shard by rank: each rank processes a subset of prompts
+    prompt_image_pairs = all_pairs[rank::world_size]
+    logging.info(f"Rank {rank}/{world_size}: processing {len(prompt_image_pairs)}/{len(all_pairs)} samples.")
 
     logging.info("Creating MagRef pipeline.")
     magref_model = magref.MagRefModel(
@@ -210,19 +225,19 @@ def generate(args):
             offload_model=args.offload_model)
         
 
-        if rank == 0:
-            # Skip the first 4 frames (which are sampled from the vae decoder first frame used as reference condition) to avoid visual blur
-            video = video[:, 4:, :, :]
-            save_file = os.path.join(args.save_dir, f"{key}.mp4")
-            logging.info(f"Saving generated video to {save_file}")
-            cache_video(
-                tensor=video[None],
-                save_file=save_file,
-                fps=cfg.sample_fps,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
-        logging.info("Finished.")
+        # Skip the first 4 frames (which are sampled from the vae decoder first frame used as reference condition) to avoid visual blur
+        video = video[:, 4:, :, :]
+        os.makedirs(args.save_dir, exist_ok=True)
+        save_file = os.path.join(args.save_dir, f"{key:05d}.mp4")
+        logging.info(f"Rank {rank}: Saving generated video to {save_file}")
+        cache_video(
+            tensor=video[None],
+            save_file=save_file,
+            fps=cfg.sample_fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1))
+        logging.info(f"Rank {rank}: Finished {key}.")
 
 
 if __name__ == "__main__":
